@@ -116,6 +116,10 @@ scala> kuduDataFrame.select("id").filter("id">=5).show()
 kuduDataFrame.registerTempTable("kudu_table")
 // Select from the dataframe
 sqlContext.sql("select id from kudu_table where id>=5").show()
+
+// It's also possible to insert into an existing kudu table
+df.write.options(Map("kudu.master"-> "your.kudu.master.here","kudu.table"-> "your.kudu.table.here")).kudu
+
 ----
 
 == Integration with MapReduce, YARN, and Other Frameworks

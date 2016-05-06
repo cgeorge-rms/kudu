@@ -29,7 +29,8 @@ import scala.collection.JavaConverters._
   */
 class KuduRDD(val kuduMaster: String,
               @transient batchSize: Integer,
-              @transient projectedCols: Array[String],
+              projectedCols: Array[String],
+              primaryKeyFirstCols: Array[String],
               @transient predicates: Array[client.KuduPredicate],
               @transient table: KuduTable,
               @transient kc: KuduContext,
@@ -52,7 +53,7 @@ class KuduRDD(val kuduMaster: String,
     val builder = kuduContext.syncClient
                          .newScanTokenBuilder(table)
                          .batchSizeBytes(batchSize)
-                         .setProjectedColumnNames(projectedCols.toSeq.asJava)
+                         .setProjectedColumnNames(primaryKeyFirstCols.toSeq.asJava)
                          .cacheBlocks(true)
 
     for (predicate <- predicates) {
@@ -70,7 +71,7 @@ class KuduRDD(val kuduMaster: String,
     val client: KuduClient = kuduContext.syncClient
     val partition: KuduPartition = part.asInstanceOf[KuduPartition]
     val scanner = KuduScanToken.deserializeIntoScanner(partition.scanToken, client)
-    new RowResultIteratorScala(scanner)
+    new RowResultIteratorScala(scanner, projectedCols, primaryKeyFirstCols)
   }
 
   override def getPreferredLocations(partition: Partition): Seq[String] = {
@@ -89,7 +90,7 @@ private[spark] class KuduPartition(val index: Int,
   * A Spark SQL [[Row]] iterator which wraps a [[KuduScanner]].
   * @param scanner the wrapped scanner
   */
-private[spark] class RowResultIteratorScala(private val scanner: KuduScanner) extends Iterator[Row] {
+private[spark] class RowResultIteratorScala(private val scanner: KuduScanner, val projectedCols: Array[String], val primaryKeyFirstCols: Array[String]) extends Iterator[Row] {
 
   private var currentIterator: RowResultIterator = null
 
@@ -101,17 +102,18 @@ private[spark] class RowResultIteratorScala(private val scanner: KuduScanner) ex
     currentIterator.hasNext
   }
 
-  override def next(): Row = new KuduRow(currentIterator.next())
+  override def next(): Row = new KuduRow(currentIterator.next(), projectedCols, primaryKeyFirstCols)
 }
 
 /**
   * A Spark SQL [[Row]] which wraps a Kudu [[RowResult]].
   * @param rowResult the wrapped row result
   */
-private[spark] class KuduRow(private val rowResult: RowResult) extends Row {
+private[spark] class KuduRow(private val rowResult: RowResult, val projectedCols: Array[String], val primaryKeyFirstCols: Array[String]) extends Row {
   override def length: Int = rowResult.getColumnProjection.getColumnCount
 
-  override def get(i: Int): Any = {
+  override def get(idx: Int): Any = {
+    val i = primaryKeyFirstCols.indexOf(projectedCols(idx))
     if (rowResult.isNull(i)) null
     else rowResult.getColumnType(i) match {
       case Type.BOOL => rowResult.getBoolean(i)

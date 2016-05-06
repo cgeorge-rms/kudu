@@ -25,6 +25,7 @@ import org.junit.Assert._
 import org.junit.runner.RunWith
 import org.scalatest.{BeforeAndAfter, FunSuite}
 import org.scalatest.junit.JUnitRunner
+import org.apache.spark.sql.functions._
 
 import scala.collection.immutable.IndexedSeq
 
@@ -62,6 +63,55 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter {
     sqlContext.read.options(
       Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).kudu
       .registerTempTable(tableName)
+  }
+
+  test("insertion") {
+    val df = sqlContext.read.options(
+      Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).kudu
+    val changedDF = df.limit(1).withColumn("key", df("key").plus(100)).withColumn("c2_s", lit("abc"))
+    changedDF.show
+    changedDF.write.options(
+        Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).mode("append").kudu
+
+
+    val newDF = sqlContext.read.options(
+      Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).kudu
+    newDF.show
+    val collected = newDF.filter("key = 100").collect()
+    assertEquals("abc", collected(0).getAs[String]("c2_s"))
+
+    deleteRow(100)
+  }
+
+  test("update row") {
+    val df = sqlContext.read.options(
+      Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).kudu
+    val baseDF = df.limit(1) // filter down to just the first row
+    baseDF.show
+    // change the c2 string to abc and update
+    val changedDF = baseDF.withColumn("c2_s", lit("abc"))
+    changedDF.show
+    changedDF.write.options(
+        Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).mode("overwrite").kudu
+
+    //read the data back
+    val newDF = sqlContext.read.options(
+      Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).kudu
+    newDF.show
+    val collected = newDF.filter("key = 0").collect()
+    assertEquals("abc", collected(0).getAs[String]("c2_s"))
+
+    //rewrite the original value
+    baseDF.withColumn("c2_s", lit("0")).write.options(
+      Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).mode("overwrite").kudu
+  }
+
+  test("out of order selection") {
+    val df = sqlContext.read.options(
+      Map("kudu.table" -> tableName, "kudu.master" -> miniCluster.getMasterAddresses)).kudu.select( "c2_s", "c1_i", "key")
+    val collected = df.collect()
+    assert(collected(0).getString(0).equals("0"))
+
   }
 
   test("table scan") {

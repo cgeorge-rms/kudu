@@ -22,11 +22,13 @@ import java.sql.Timestamp
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{Row, SQLContext}
+import org.apache.spark.sql.{DataFrame, Row, SQLContext, SaveMode}
 import org.kududb.Type
 import org.kududb.annotations.InterfaceStability
-import org.kududb.client.{KuduPredicate, KuduTable}
+import org.kududb.client._
 import org.kududb.client.KuduPredicate.ComparisonOp
+import org.kududb.client.SessionConfiguration.FlushMode
+import org.apache.spark.sql.SaveMode._
 
 import scala.collection.JavaConverters._
 
@@ -35,7 +37,7 @@ import scala.collection.JavaConverters._
   * This class will produce a relationProvider based on input given to it from spark.
   */
 @InterfaceStability.Unstable
-class DefaultSource extends RelationProvider {
+class DefaultSource extends RelationProvider with CreatableRelationProvider {
 
   val TABLE_KEY = "kudu.table"
   val KUDU_MASTER = "kudu.master"
@@ -59,6 +61,36 @@ class DefaultSource extends RelationProvider {
 
     new KuduRelation(tableName.get, kuduMaster)(sqlContext)
   }
+
+  /**
+    * Creates a relation and inserts data to specified table.
+    *
+    * @param sqlContext
+    * @param mode Append will not overwrite existing data, Overwrite will perform update, but will not insert data, use upsert on KuduContext if you require both
+    * @param parameters Nessisary parameters for kudu.table and kudu.master
+    * @param data Dataframe to save into kudu
+    * @return returns populated base relation
+    */
+  override def createRelation(sqlContext: SQLContext, mode: SaveMode, parameters: Map[String, String], data: DataFrame): BaseRelation = {
+    val tableName = parameters.get(TABLE_KEY)
+    if (tableName.isEmpty) {
+      throw new IllegalArgumentException(s"Invalid value for $TABLE_KEY '$tableName'")
+    }
+
+    val kuduMaster = parameters.getOrElse(KUDU_MASTER, "localhost")
+
+    val kuduRelation = new KuduRelation(tableName.get, kuduMaster)(sqlContext)
+    mode match {
+      case Append => kuduRelation.insert(data, overwrite = false)
+      case Overwrite => kuduRelation.insert(data, overwrite = true)
+      case ErrorIfExists =>
+          throw new UnsupportedOperationException(
+            "ErrorIfExists is currently not supported")
+      case Ignore => kuduRelation.insert(data, overwrite = false)
+    }
+
+    new KuduRelation(tableName.get, kuduMaster)(sqlContext)
+  }
 }
 
 /**
@@ -73,10 +105,14 @@ class KuduRelation(private val tableName: String,
                    private val kuduMaster: String)(
                    val sqlContext: SQLContext)
 extends BaseRelation
-with PrunedFilteredScan {
+with PrunedFilteredScan
+with InsertableRelation with Serializable {
+
   import KuduRelation._
 
+  @transient
   private val context: KuduContext = new KuduContext(kuduMaster)
+  @transient
   private val table: KuduTable = context.syncClient.openTable(tableName)
 
   override def unhandledFilters(filters: Array[Filter]): Array[Filter] =
@@ -103,12 +139,15 @@ with PrunedFilteredScan {
     *
     * @param requiredColumns columns that are being requested by the requesting query
     * @param filters         filters that are being applied by the requesting query
-    * @return                RDD will all the results from Kudu
+    * @return RDD will all the results from Kudu
     */
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
     val predicates = filters.flatMap(filterToPredicate)
-    new KuduRDD(kuduMaster, 1024*1024*20, requiredColumns, predicates,
-                table, context, sqlContext.sparkContext)
+    val primaryKeys = table.getSchema.getPrimaryKeyColumns.asScala.map(_.getName)
+    val columns = requiredColumns.intersect(primaryKeys) ++ (requiredColumns diff primaryKeys) //kudu requires the primary key to be the first columns retrieved
+
+    new KuduRDD(kuduMaster, 1024 * 1024 * 20, requiredColumns, columns, predicates,
+      table, context, sqlContext.sparkContext)
   }
 
   /**
@@ -159,6 +198,16 @@ with PrunedFilteredScan {
       case value: Array[Byte] => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
     }
   }
+
+  /**
+    * Inserts data into an existing kudu table.
+    * @param data Dataframe to be inserted into kudu
+    * @param overwrite If True it will update existing records, but will not perform inserts. Use upsert on kudu context if you require both
+    */
+  override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+    data.foreachPartition(iterator => new KuduContext(kuduMaster).savePartition(iterator, tableName, overwrite))
+  }
+
 }
 
 private[spark] object KuduRelation {
